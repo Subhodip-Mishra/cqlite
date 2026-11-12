@@ -1,0 +1,4 @@
+cqlite
+main
+*.db
+*.out
