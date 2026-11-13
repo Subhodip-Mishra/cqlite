@@ -2,3 +2,4 @@ cqlite
 main
 *.db
 *.out
+*.db
