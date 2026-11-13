@@ -74,20 +74,46 @@ void* get_page(Pager* pager, uint32_t page_num) {
 }
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+    if (page_num >= TABLE_MAX_PAGES) {
+        printf("Tried to flush page number out of bounds. %d >= %d\n", page_num, TABLE_MAX_PAGES);
+        exit(EXIT_FAILURE);
+    }
+    
     if (pager->pages[page_num] == NULL) {
         printf("Tried to flush null page\n");
         exit(EXIT_FAILURE);
     }
 
     off_t offset = (off_t)page_num * PAGE_SIZE;
-    ssize_t bytes_written = pwrite(pager->file_descriptor, pager->pages[page_num], size, offset);
-    if (bytes_written == -1) {
-        printf("Error writing: %d\n", errno);
-        exit(EXIT_FAILURE);
+    const uint8_t* buf = (const uint8_t*)pager->pages[page_num];
+    size_t total_written = 0;
+
+    while (total_written < size) {
+        ssize_t bytes_written = pwrite(
+            pager->file_descriptor,
+            buf + total_written,
+            size - total_written,
+            offset + (off_t)total_written
+        );
+
+        if (bytes_written == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            printf("Error writing: %d\n", errno);
+            exit(EXIT_FAILURE);
+        }
+
+        if (bytes_written == 0) {
+            printf("Error writing: unexpected zero-byte write\n");
+            exit(EXIT_FAILURE);
+        }
+
+        total_written += (size_t)bytes_written;
     }
 
     // Update file_length when file extends
-    uint32_t new_end = (uint32_t)offset + (uint32_t)bytes_written;
+    uint32_t new_end = (uint32_t)offset + (uint32_t)total_written;
     if (new_end > pager->file_length) {
         pager->file_length = new_end;
     }
