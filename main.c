@@ -1,42 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
-#include <errno.h>
-#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "pager.h"
-
-#define COLUMN_USERNAME_SIZE 32
-#define COLUMN_EMAIL_SIZE 255
-
-typedef struct
-{
-    uint32_t id;
-    char username[COLUMN_USERNAME_SIZE + 1];
-    char email[COLUMN_EMAIL_SIZE + 1];
-} Row;
-
-#define size_of_attribute(Struct, Attribute) sizeof(((Struct *)0)->Attribute)
-
-const uint32_t ID_SIZE = size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
-const uint32_t ID_OFFSET = 0;
-const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
-typedef struct
-{
-    Pager *pager;
-    uint32_t num_rows;
-} Table;
+#include <errno.h>
+#include "table.h"
+#include "btree.h"
 
 typedef struct
 {
@@ -63,6 +34,8 @@ typedef enum
 typedef enum
 {
     EXECUTE_SUCCESS,
+    EXECUTE_DUPLICATE_KEY,
+    EXECUTE_NOT_FOUND,
     EXECUTE_TABLE_FULL
 } ExecuteResult;
 
@@ -76,101 +49,18 @@ typedef struct
 {
     StatementType type;
     Row row_to_insert;
+    bool has_where_id;
+    uint32_t target_id;
 } Statement;
 
-void print_row(Row *row)
+InputBuffer *new_input_buffer(void)
 {
-    printf("(%d, %s, %s)\n", row->id, row->username, row->email);
-}
-
-void serialize_row(Row *source, void *destination)
-{
-    memcpy((char *)destination + ID_OFFSET, &(source->id), ID_SIZE);
-    memcpy((char *)destination + USERNAME_OFFSET, &(source->username), USERNAME_SIZE);
-    memcpy((char *)destination + EMAIL_OFFSET, &(source->email), EMAIL_SIZE);
-}
-
-void deserialize_row(void *source, Row *destination)
-{
-    memcpy(&(destination->id), (char *)source + ID_OFFSET, ID_SIZE);
-    memcpy(&(destination->username), (char *)source + USERNAME_OFFSET, USERNAME_SIZE);
-    memcpy(&(destination->email), (char *)source + EMAIL_OFFSET, EMAIL_SIZE);
-}
-
-void *row_slot(Table *table, uint32_t row_num)
-{
-    uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void *page = get_page(table->pager, page_num);
-    uint32_t row_offset = row_num % ROWS_PER_PAGE;
-    uint32_t byte_offset = row_offset * ROW_SIZE;
-    return (char *)page + byte_offset;
-}
-
-Table *db_open(const char *filename)
-{
-    Pager *pager = pager_open(filename);
-    uint32_t num_rows = pager->file_length / ROW_SIZE;
-
-    Table *table = (Table *)malloc(sizeof(Table));
-    table->pager = pager;
-    table->num_rows = num_rows;
-
-    return table;
-}
-
-void db_close(Table *table)
-{
-    Pager *pager = table->pager;
-    uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
-
-    for (uint32_t i = 0; i < num_full_pages; i++)
+    InputBuffer *input_buffer = malloc(sizeof(InputBuffer));
+    if (input_buffer == NULL)
     {
-        if (pager->pages[i] == NULL)
-        {
-            continue;
-        }
-        pager_flush(pager, i, PAGE_SIZE);
-        free(pager->pages[i]);
-        pager->pages[i] = NULL;
-    }
-
-    // Flush partial page at the end of the file
-    uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
-    if (num_additional_rows > 0)
-    {
-        uint32_t page_num = num_full_pages;
-        if (pager->pages[page_num] != NULL)
-        {
-            pager_flush(pager, page_num, num_additional_rows * ROW_SIZE);
-            free(pager->pages[page_num]);
-            pager->pages[page_num] = NULL;
-        }
-    }
-
-    int result = close(pager->file_descriptor);
-    if (result == -1)
-    {
-        printf("Error closing db file.\n");
+        printf("Memory allocation failed for InputBuffer\n");
         exit(EXIT_FAILURE);
     }
-
-    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
-    {
-        void *page = pager->pages[i];
-        if (page)
-        {
-            free(page);
-            pager->pages[i] = NULL;
-        }
-    }
-
-    free(pager);
-    free(table);
-}
-
-InputBuffer *new_input_buffer()
-{
-    InputBuffer *input_buffer = (InputBuffer *)malloc(sizeof(InputBuffer));
     input_buffer->buffer = NULL;
     input_buffer->buffer_length = 0;
     input_buffer->input_length = 0;
@@ -183,7 +73,7 @@ void close_input_buffer(InputBuffer *input_buffer)
     free(input_buffer);
 }
 
-void print_prompt()
+void print_prompt(void)
 {
     printf("cqlite > ");
 }
@@ -210,10 +100,45 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table)
         db_close(table);
         exit(EXIT_SUCCESS);
     }
-    else
+    if (strcmp(input_buffer->buffer, ".btree") == 0)
     {
-        return META_COMMAND_UNRECOGNIZED_COMMAND;
+        printf("Tree:\n");
+        print_tree(table->pager, 0, 0);
+        return META_COMMAND_SUCCESS;
     }
+    if (strcmp(input_buffer->buffer, ".stats") == 0)
+    {
+        printf("Database Stats:\n");
+        printf("  Page Size:        %d bytes\n", PAGE_SIZE);
+        printf("  Row Size:         %lu bytes\n", (unsigned long)ROW_SIZE);
+        printf("  Leaf Max Cells:   %lu\n", (unsigned long)LEAF_NODE_MAX_CELLS);
+        printf("  Allocated Pages:  %u\n", table->pager->num_pages);
+        return META_COMMAND_SUCCESS;
+    }
+    return META_COMMAND_UNRECOGNIZED_COMMAND;
+}
+
+static bool parse_uint32(const char *str, uint32_t *out, bool *is_negative)
+{
+    if (str == NULL || *str == '\0')
+    {
+        return false;
+    }
+    if (*str == '-')
+    {
+        *is_negative = true;
+        return false;
+    }
+    *is_negative = false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long val = strtoul(str, &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || val > UINT32_MAX)
+    {
+        return false;
+    }
+    *out = (uint32_t)val;
+    return true;
 }
 
 PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement)
@@ -230,10 +155,11 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement)
         return PREPARE_SYNTAX_ERROR;
     }
 
-    int id = atoi(id_string);
-    if (id < 0)
+    uint32_t id = 0;
+    bool is_negative = false;
+    if (!parse_uint32(id_string, &id, &is_negative))
     {
-        return PREPARE_NEGATIVE_ID;
+        return is_negative ? PREPARE_NEGATIVE_ID : PREPARE_SYNTAX_ERROR;
     }
     if (strlen(username) > COLUMN_USERNAME_SIZE)
     {
@@ -251,16 +177,65 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement)
     return PREPARE_SUCCESS;
 }
 
+PrepareResult prepare_select(InputBuffer *input_buffer, Statement *statement)
+{
+    statement->type = STATEMENT_SELECT;
+    statement->has_where_id = false;
+    statement->target_id = 0;
+
+    strtok(input_buffer->buffer, " ");
+    char *arg1 = strtok(NULL, " ");
+
+    if (arg1 == NULL)
+    {
+        return PREPARE_SUCCESS;
+    }
+
+    /* Supports both: `select 15` and `select where id = 15` */
+    char *id_string = NULL;
+    if (strcmp(arg1, "where") == 0)
+    {
+        char *col = strtok(NULL, " ");
+        char *eq = strtok(NULL, " ");
+        id_string = strtok(NULL, " ");
+        if (col == NULL || strcmp(col, "id") != 0 || eq == NULL || strcmp(eq, "=") != 0 || id_string == NULL)
+        {
+            return PREPARE_SYNTAX_ERROR;
+        }
+    }
+    else
+    {
+        id_string = arg1;
+    }
+
+    if (strtok(NULL, " ") != NULL)
+    {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    uint32_t id = 0;
+    bool is_negative = false;
+    if (!parse_uint32(id_string, &id, &is_negative))
+    {
+        return is_negative ? PREPARE_NEGATIVE_ID : PREPARE_SYNTAX_ERROR;
+    }
+
+    statement->has_where_id = true;
+    statement->target_id = id;
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
 {
-    if (strncmp(input_buffer->buffer, "insert", 6) == 0)
+    if (strncmp(input_buffer->buffer, "insert", 6) == 0 &&
+        (input_buffer->buffer[6] == ' ' || input_buffer->buffer[6] == '\0'))
     {
         return prepare_insert(input_buffer, statement);
     }
-    if (strcmp(input_buffer->buffer, "select") == 0)
+    if (strncmp(input_buffer->buffer, "select", 6) == 0 &&
+        (input_buffer->buffer[6] == ' ' || input_buffer->buffer[6] == '\0'))
     {
-        statement->type = STATEMENT_SELECT;
-        return PREPARE_SUCCESS;
+        return prepare_select(input_buffer, statement);
     }
 
     return PREPARE_UNRECOGNIZED_STATEMENT;
@@ -268,27 +243,61 @@ PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
 
 ExecuteResult execute_insert(Statement *statement, Table *table)
 {
-    if (table->num_rows >= TABLE_MAX_ROWS)
+    Row *row_to_insert = &(statement->row_to_insert);
+    uint32_t key_to_insert = row_to_insert->id;
+    Cursor *cursor = table_find(table, key_to_insert);
+
+    void *node = get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = (*leaf_node_num_cells(node));
+
+    if (cursor->cell_num < num_cells)
     {
-        return EXECUTE_TABLE_FULL;
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if (key_at_index == key_to_insert)
+        {
+            free(cursor);
+            return EXECUTE_DUPLICATE_KEY;
+        }
     }
 
-    Row *row_to_insert = &(statement->row_to_insert);
-    serialize_row(row_to_insert, row_slot(table, table->num_rows));
-    table->num_rows += 1;
+    leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
+    free(cursor);
 
     return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement *statement, Table *table)
 {
-    (void)statement;
-    Row row;
-    for (uint32_t i = 0; i < table->num_rows; i++)
+    if (statement->has_where_id)
     {
-        deserialize_row(row_slot(table, i), &row);
+        Cursor *cursor = table_find(table, statement->target_id);
+        void *node = get_page(table->pager, cursor->page_num);
+        uint32_t num_cells = *leaf_node_num_cells(node);
+
+        if (cursor->cell_num >= num_cells || *leaf_node_key(node, cursor->cell_num) != statement->target_id)
+        {
+            free(cursor);
+            return EXECUTE_NOT_FOUND;
+        }
+
+        Row row;
+        deserialize_row(cursor_value(cursor), &row);
         print_row(&row);
+        free(cursor);
+        return EXECUTE_SUCCESS;
     }
+
+    Cursor *cursor = table_start(table);
+
+    Row row;
+    while (!(cursor->end_of_table))
+    {
+        deserialize_row(cursor_value(cursor), &row);
+        print_row(&row);
+        cursor_advance(cursor);
+    }
+
+    free(cursor);
     return EXECUTE_SUCCESS;
 }
 
@@ -296,9 +305,9 @@ ExecuteResult execute_statement(Statement *statement, Table *table)
 {
     switch (statement->type)
     {
-    case (STATEMENT_INSERT):
+    case STATEMENT_INSERT:
         return execute_insert(statement, table);
-    case (STATEMENT_SELECT):
+    case STATEMENT_SELECT:
         return execute_select(statement, table);
     }
     return EXECUTE_SUCCESS;
@@ -325,9 +334,9 @@ int main(int argc, char *argv[])
         {
             switch (do_meta_command(input_buffer, table))
             {
-            case (META_COMMAND_SUCCESS):
+            case META_COMMAND_SUCCESS:
                 continue;
-            case (META_COMMAND_UNRECOGNIZED_COMMAND):
+            case META_COMMAND_UNRECOGNIZED_COMMAND:
                 printf("Unrecognized command '%s'\n", input_buffer->buffer);
                 continue;
             }
@@ -336,28 +345,34 @@ int main(int argc, char *argv[])
         Statement statement;
         switch (prepare_statement(input_buffer, &statement))
         {
-        case (PREPARE_SUCCESS):
+        case PREPARE_SUCCESS:
             break;
-        case (PREPARE_NEGATIVE_ID):
+        case PREPARE_NEGATIVE_ID:
             printf("ID must be positive.\n");
             continue;
-        case (PREPARE_STRING_TOO_LONG):
+        case PREPARE_STRING_TOO_LONG:
             printf("String is too long.\n");
             continue;
-        case (PREPARE_SYNTAX_ERROR):
+        case PREPARE_SYNTAX_ERROR:
             printf("Syntax error. Could not parse statement.\n");
             continue;
-        case (PREPARE_UNRECOGNIZED_STATEMENT):
+        case PREPARE_UNRECOGNIZED_STATEMENT:
             printf("Unrecognized keyword at start of '%s'.\n", input_buffer->buffer);
             continue;
         }
 
         switch (execute_statement(&statement, table))
         {
-        case (EXECUTE_SUCCESS):
+        case EXECUTE_SUCCESS:
             printf("Executed.\n");
             break;
-        case (EXECUTE_TABLE_FULL):
+        case EXECUTE_DUPLICATE_KEY:
+            printf("Error: Duplicate key.\n");
+            break;
+        case EXECUTE_NOT_FOUND:
+            printf("Row not found.\n");
+            break;
+        case EXECUTE_TABLE_FULL:
             printf("Error: Table full.\n");
             break;
         }
