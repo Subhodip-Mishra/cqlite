@@ -13,6 +13,10 @@ static void ensure_page_capacity(Pager* pager, uint32_t page_num) {
     }
     uint32_t new_cap = pager->max_pages;
     while (new_cap <= page_num) {
+        if (new_cap > UINT32_MAX / 2) {
+            new_cap = page_num + 1;
+            break;
+        }
         new_cap *= 2;
     }
     PageFrame** new_pages = realloc(pager->pages, new_cap * sizeof(PageFrame*));

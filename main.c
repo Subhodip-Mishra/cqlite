@@ -42,7 +42,9 @@ typedef enum
 typedef enum
 {
     STATEMENT_INSERT,
-    STATEMENT_SELECT
+    STATEMENT_SELECT,
+    STATEMENT_UPDATE,
+    STATEMENT_DELETE
 } StatementType;
 
 typedef struct
@@ -113,6 +115,9 @@ MetaCommandResult do_meta_command(InputBuffer *input_buffer, Table *table)
         printf("  Row Size:         %lu bytes\n", (unsigned long)ROW_SIZE);
         printf("  Leaf Max Cells:   %lu\n", (unsigned long)LEAF_NODE_MAX_CELLS);
         printf("  Allocated Pages:  %u\n", table->pager->num_pages);
+        printf("  Cached Pages:     %u / %d (Hits: %lu, Misses: %lu)\n",
+               table->pager->cached_pages, CACHE_MAX_PAGES,
+               table->pager->cache_hits, table->pager->cache_misses);
         return META_COMMAND_SUCCESS;
     }
     return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -150,7 +155,7 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement)
     char *username = strtok(NULL, " ");
     char *email = strtok(NULL, " ");
 
-    if (id_string == NULL || username == NULL || email == NULL)
+    if (id_string == NULL || username == NULL || email == NULL || strtok(NULL, " ") != NULL)
     {
         return PREPARE_SYNTAX_ERROR;
     }
@@ -161,11 +166,7 @@ PrepareResult prepare_insert(InputBuffer *input_buffer, Statement *statement)
     {
         return is_negative ? PREPARE_NEGATIVE_ID : PREPARE_SYNTAX_ERROR;
     }
-    if (strlen(username) > COLUMN_USERNAME_SIZE)
-    {
-        return PREPARE_STRING_TOO_LONG;
-    }
-    if (strlen(email) > COLUMN_EMAIL_SIZE)
+    if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE)
     {
         return PREPARE_STRING_TOO_LONG;
     }
@@ -191,7 +192,6 @@ PrepareResult prepare_select(InputBuffer *input_buffer, Statement *statement)
         return PREPARE_SUCCESS;
     }
 
-    /* Supports both: `select 15` and `select where id = 15` */
     char *id_string = NULL;
     if (strcmp(arg1, "where") == 0)
     {
@@ -225,6 +225,82 @@ PrepareResult prepare_select(InputBuffer *input_buffer, Statement *statement)
     return PREPARE_SUCCESS;
 }
 
+PrepareResult prepare_update(InputBuffer *input_buffer, Statement *statement)
+{
+    statement->type = STATEMENT_UPDATE;
+
+    strtok(input_buffer->buffer, " ");
+    char *id_string = strtok(NULL, " ");
+    char *username = strtok(NULL, " ");
+    char *email = strtok(NULL, " ");
+
+    if (id_string == NULL || username == NULL || email == NULL || strtok(NULL, " ") != NULL)
+    {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    uint32_t id = 0;
+    bool is_negative = false;
+    if (!parse_uint32(id_string, &id, &is_negative))
+    {
+        return is_negative ? PREPARE_NEGATIVE_ID : PREPARE_SYNTAX_ERROR;
+    }
+    if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE)
+    {
+        return PREPARE_STRING_TOO_LONG;
+    }
+
+    statement->row_to_insert.id = id;
+    strcpy(statement->row_to_insert.username, username);
+    strcpy(statement->row_to_insert.email, email);
+
+    return PREPARE_SUCCESS;
+}
+
+PrepareResult prepare_delete(InputBuffer *input_buffer, Statement *statement)
+{
+    statement->type = STATEMENT_DELETE;
+    statement->has_where_id = true;
+
+    strtok(input_buffer->buffer, " ");
+    char *arg1 = strtok(NULL, " ");
+    if (arg1 == NULL)
+    {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    char *id_string = NULL;
+    if (strcmp(arg1, "where") == 0)
+    {
+        char *col = strtok(NULL, " ");
+        char *eq = strtok(NULL, " ");
+        id_string = strtok(NULL, " ");
+        if (col == NULL || strcmp(col, "id") != 0 || eq == NULL || strcmp(eq, "=") != 0 || id_string == NULL)
+        {
+            return PREPARE_SYNTAX_ERROR;
+        }
+    }
+    else
+    {
+        id_string = arg1;
+    }
+
+    if (strtok(NULL, " ") != NULL)
+    {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    uint32_t id = 0;
+    bool is_negative = false;
+    if (!parse_uint32(id_string, &id, &is_negative))
+    {
+        return is_negative ? PREPARE_NEGATIVE_ID : PREPARE_SYNTAX_ERROR;
+    }
+
+    statement->target_id = id;
+    return PREPARE_SUCCESS;
+}
+
 PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
 {
     if (strncmp(input_buffer->buffer, "insert", 6) == 0 &&
@@ -236,6 +312,16 @@ PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
         (input_buffer->buffer[6] == ' ' || input_buffer->buffer[6] == '\0'))
     {
         return prepare_select(input_buffer, statement);
+    }
+    if (strncmp(input_buffer->buffer, "update", 6) == 0 &&
+        (input_buffer->buffer[6] == ' ' || input_buffer->buffer[6] == '\0'))
+    {
+        return prepare_update(input_buffer, statement);
+    }
+    if (strncmp(input_buffer->buffer, "delete", 6) == 0 &&
+        (input_buffer->buffer[6] == ' ' || input_buffer->buffer[6] == '\0'))
+    {
+        return prepare_delete(input_buffer, statement);
     }
 
     return PREPARE_UNRECOGNIZED_STATEMENT;
@@ -301,6 +387,27 @@ ExecuteResult execute_select(Statement *statement, Table *table)
     return EXECUTE_SUCCESS;
 }
 
+ExecuteResult execute_update(Statement *statement, Table *table)
+{
+    Row *row_to_update = &(statement->row_to_insert);
+    Cursor *cursor = table_find(table, row_to_update->id);
+
+    bool updated = leaf_node_update(cursor, row_to_update->id, row_to_update);
+    free(cursor);
+
+    return updated ? EXECUTE_SUCCESS : EXECUTE_NOT_FOUND;
+}
+
+ExecuteResult execute_delete(Statement *statement, Table *table)
+{
+    Cursor *cursor = table_find(table, statement->target_id);
+
+    bool deleted = leaf_node_delete(cursor, statement->target_id);
+    free(cursor);
+
+    return deleted ? EXECUTE_SUCCESS : EXECUTE_NOT_FOUND;
+}
+
 ExecuteResult execute_statement(Statement *statement, Table *table)
 {
     switch (statement->type)
@@ -309,6 +416,10 @@ ExecuteResult execute_statement(Statement *statement, Table *table)
         return execute_insert(statement, table);
     case STATEMENT_SELECT:
         return execute_select(statement, table);
+    case STATEMENT_UPDATE:
+        return execute_update(statement, table);
+    case STATEMENT_DELETE:
+        return execute_delete(statement, table);
     }
     return EXECUTE_SUCCESS;
 }

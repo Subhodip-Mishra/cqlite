@@ -408,8 +408,22 @@ Cursor *table_start(Table *table)
 
     void *node = get_page(table->pager, cursor->page_num);
     uint32_t num_cells = *leaf_node_num_cells(node);
-    cursor->end_of_table = (num_cells == 0);
 
+    while (num_cells == 0)
+    {
+        uint32_t next_page_num = *leaf_node_next_leaf(node);
+        if (next_page_num == 0)
+        {
+            cursor->end_of_table = true;
+            return cursor;
+        }
+        cursor->page_num = next_page_num;
+        cursor->cell_num = 0;
+        node = get_page(table->pager, cursor->page_num);
+        num_cells = *leaf_node_num_cells(node);
+    }
+
+    cursor->end_of_table = false;
     return cursor;
 }
 
@@ -482,21 +496,20 @@ void cursor_advance(Cursor *cursor)
     void *node = get_page(cursor->table->pager, page_num);
 
     cursor->cell_num += 1;
-    if (cursor->cell_num >= (*leaf_node_num_cells(node)))
+    while (cursor->cell_num >= (*leaf_node_num_cells(node)))
     {
-        /* Jump to next sibling leaf node via next_leaf pointer */
         uint32_t next_page_num = *leaf_node_next_leaf(node);
         if (next_page_num == 0)
         {
             cursor->end_of_table = true;
+            return;
         }
-        else
-        {
-            cursor->page_num = next_page_num;
-            cursor->cell_num = 0;
-        }
+        cursor->page_num = next_page_num;
+        cursor->cell_num = 0;
+        node = get_page(cursor->table->pager, cursor->page_num);
     }
 }
+
 
 void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value)
 {
@@ -521,6 +534,57 @@ void leaf_node_insert(Cursor *cursor, uint32_t key, Row *value)
     *(leaf_node_key(node, cursor->cell_num)) = key;
     serialize_row(value, leaf_node_value(node, cursor->cell_num));
     mark_page_dirty(cursor->table->pager, cursor->page_num);
+}
+
+bool leaf_node_update(Cursor *cursor, uint32_t key, Row *value)
+{
+    void *node = get_page(cursor->table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if (cursor->cell_num >= num_cells)
+    {
+        return false;
+    }
+
+    if (*leaf_node_key(node, cursor->cell_num) != key)
+    {
+        return false;
+    }
+
+    /* In-place value overwrite without page allocation or split */
+    serialize_row(value, leaf_node_value(node, cursor->cell_num));
+    mark_page_dirty(cursor->table->pager, cursor->page_num);
+    return true;
+}
+
+bool leaf_node_delete(Cursor *cursor, uint32_t key)
+{
+    void *node = get_page(cursor->table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    if (cursor->cell_num >= num_cells)
+    {
+        return false;
+    }
+
+    if (*leaf_node_key(node, cursor->cell_num) != key)
+    {
+        return false;
+    }
+
+    /* Shift subsequent cells left by one slot */
+    if (cursor->cell_num < num_cells - 1)
+    {
+        memmove(
+            leaf_node_cell(node, cursor->cell_num),
+            leaf_node_cell(node, cursor->cell_num + 1),
+            (size_t)(num_cells - 1 - cursor->cell_num) * LEAF_NODE_CELL_SIZE
+        );
+    }
+
+    *(leaf_node_num_cells(node)) = num_cells - 1;
+    mark_page_dirty(cursor->table->pager, cursor->page_num);
+    return true;
 }
 
 /* Tree Visualizer for `.btree` meta-command */

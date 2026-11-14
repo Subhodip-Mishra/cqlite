@@ -50,7 +50,7 @@ typedef enum {
 #define INTERNAL_NODE_KEY_SIZE   sizeof(uint32_t)
 #define INTERNAL_NODE_CHILD_SIZE sizeof(uint32_t)
 #define INTERNAL_NODE_CELL_SIZE  (INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE)
-#define INTERNAL_NODE_MAX_CELLS  510  /* Kept compact to exercise internal splits easily; increase to 510 for prod */
+#define INTERNAL_NODE_MAX_CELLS  510
 
 /* Cursor Abstraction */
 typedef struct {
@@ -90,6 +90,8 @@ Cursor* table_find(Table* table, uint32_t key);
 void* cursor_value(Cursor* cursor);
 void cursor_advance(Cursor* cursor);
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value);
+bool leaf_node_update(Cursor* cursor, uint32_t key, Row* value);
+bool leaf_node_delete(Cursor* cursor, uint32_t key);
 void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level);
 
 #endif // BTREE_H
