@@ -3,14 +3,21 @@
 An embedded relational database engine built from scratch in pure C11 (`-Wall -Wextra -Werror`), inspired by SQLite.
 
 ## Architecture
-`SQL String` ➔ `Tokenizer / Parser` ➔ `AST` ➔ `Bytecode` ➔ `Virtual Machine` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db)`
+`SQL String` ➔ `Tokenizer / Parser` ➔ `Statement Compiler` ➔ `Write-Ahead Log (WAL + CRC32)` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db / .wal)`
 
 ## Current Features
-- **REPL & Statement Compiler:** Custom input buffer, meta-command execution (`.exit`, `.btree`, `.constants`), and deterministic parsing for `insert` and `select`.
-- **Binary Row Serialization:** Fixed-size (`291-byte`) binary serialization packing records (`id`, `username`, `email`) directly onto raw memory offsets.
+- **Full CRUD & REPL Engine:** Deterministic parsing and execution for `insert`, `select` (full scan & `where id = <key>` point lookups), `update`, and `delete`, alongside meta-commands (`.exit`, `.btree`, `.stats`, `.checkpoint`).
+- **Write-Ahead Log (WAL) & Crash Recovery:**
+  - Append-only binary WAL framing (`Magic` + `OpType` + `Key` + `Row Payload` + `IEEE 802.3 CRC32` checksum) written prior to B+ Tree page mutations.
+  - Automatic idempotent crash recovery on startup (`db_open`) with torn-frame detection and `.checkpoint` log truncation via `ftruncate()` + `fsync()`.
+- **ACID Transactions & Group Commit:**
+  - Explicit `begin`, `commit`, and `rollback` transaction control.
+  - **Group Commit:** Defers per-statement `fsync()` calls inside active transactions until `commit`, flushing buffered WAL frames in a single atomic disk sync.
+  - **Atomic Rollback:** Discards dirty in-memory cache frames and truncates uncommitted WAL records cleanly.
+- **Binary Row Serialization:** Fixed-size (`293-byte`) binary serialization packing records (`id`, `username`, `email`) directly onto raw memory offsets.
 - **Disk-Backed B+ Tree Storage Engine:**
-  - Multi-level Internal Nodes (key-child routing) and Leaf Nodes (sorted 291-byte data cells) packed inside 4KB slotted pages.
-  - Binary search within nodes for $O(\log N)$ point lookups and cursor-based sequential scans.
+  - Multi-level Internal Nodes (key-child routing) and Leaf Nodes (sorted 293-byte data cells) packed inside 4KB pages.
+  - Binary search within nodes for $O(\log N)$ point lookups, in-place updates, cell deletion, and cursor-based sequential scans.
   - Recursive leaf and internal node splitting for dynamic tree growth.
 - **Hardened 4KB Pager & 64 MB LRU Buffer Pool:**
   - `4096-byte` hardware-aligned pages via `posix_memalign()`.
@@ -31,9 +38,12 @@ Tested on Linux (Ubuntu 24.04 LTS, SSD, `gcc -O3`) under a strict **64 MB fixed 
 
 > **Key Takeaway:** Scaling from **5.60 GB (10M rows)** to **11.20 GB (20M rows)** increases average random lookup latency by less than **9%** (`229.25 µs` → `248.92 µs`), confirming logarithmic $O(\log N)$ B+ Tree scaling within a bounded 64 MB memory budget.
 
-## Build & Run
+## Usage Examples
 
-### Using Make
-```bash
-make
-./cqlite test.db
+### CRUD & Point Lookups
+```sql
+cqlite > insert 1 suvodeep suvodeep@valko.studio
+cqlite > select where id = 1
+(1, suvodeep, suvodeep@valko.studio)
+cqlite > update 1 suvodeep founder@valko.studio
+cqlite > delete where id = 1
