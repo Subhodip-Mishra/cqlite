@@ -3,16 +3,19 @@
 An embedded relational database engine built from scratch in pure C11 (`-Wall -Wextra -Werror`), inspired by SQLite.
 
 ## Architecture
-`SQL String` ➔ `Tokenizer / Parser` ➔ `Statement Compiler` ➔ `Write-Ahead Log (WAL + CRC32)` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db / .wal)`
+`SQL String` ➔ `Custom Tokenizer / Lexer` ➔ `Recursive SQL Parser` ➔ `Write-Ahead Log (WAL + CRC32)` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db / .wal)`
 
 ## Current Features
-- **Full CRUD & REPL Engine:** Deterministic parsing and execution for `insert`, `select` (full scan & `where id = <key>` point lookups), `update`, and `delete`, alongside meta-commands (`.exit`, `.btree`, `.stats`, `.checkpoint`).
+- **Custom Tokenizer / Lexer & SQL Parser:**
+  - Zero-allocation state-machine lexer (`tokenizer.c`) supporting single/double-quoted string literals with escape sequences (`'Suvodeep Mishra'`), numeric literals, punctuation, and case-insensitive SQL keywords.
+  - Supports standard SQL queries (`INSERT INTO ... VALUES (...)`, `SELECT * FROM ... WHERE ...`, partial/full column `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`) with optional trailing `;` alongside legacy REPL shorthand commands.
+- **Full CRUD & REPL Engine:** Deterministic execution for `INSERT`, `SELECT` (full scan & `WHERE id = <key>` point lookups), `UPDATE`, and `DELETE`, alongside meta-commands (`.exit`, `.btree`, `.stats`, `.checkpoint`).
 - **Write-Ahead Log (WAL) & Crash Recovery:**
   - Append-only binary WAL framing (`Magic` + `OpType` + `Key` + `Row Payload` + `IEEE 802.3 CRC32` checksum) written prior to B+ Tree page mutations.
   - Automatic idempotent crash recovery on startup (`db_open`) with torn-frame detection and `.checkpoint` log truncation via `ftruncate()` + `fsync()`.
 - **ACID Transactions & Group Commit:**
-  - Explicit `begin`, `commit`, and `rollback` transaction control.
-  - **Group Commit:** Defers per-statement `fsync()` calls inside active transactions until `commit`, flushing buffered WAL frames in a single atomic disk sync.
+  - Explicit `BEGIN`, `COMMIT`, and `ROLLBACK` transaction control.
+  - **Group Commit:** Defers per-statement `fsync()` calls inside active transactions until `COMMIT`, flushing buffered WAL frames in a single atomic disk sync.
   - **Atomic Rollback:** Discards dirty in-memory cache frames and truncates uncommitted WAL records cleanly.
 - **Binary Row Serialization:** Fixed-size (`293-byte`) binary serialization packing records (`id`, `username`, `email`) directly onto raw memory offsets.
 - **Disk-Backed B+ Tree Storage Engine:**
@@ -22,7 +25,7 @@ An embedded relational database engine built from scratch in pure C11 (`-Wall -W
 - **Hardened 4KB Pager & 64 MB LRU Buffer Pool:**
   - `4096-byte` hardware-aligned pages via `posix_memalign()`.
   - Fixed-cap **LRU Page Cache** (`16,384` frames = `64 MB` max RAM) using an $O(1)$ doubly-linked list and direct page lookup table.
-  - **Dirty-Bit Optimization (`is_dirty`):** Tracks modified pages in memory so read-heavy workloads (`select`) trigger zero redundant `pwrite()` syscalls during cache eviction.
+  - **Dirty-Bit Optimization (`is_dirty`):** Tracks modified pages in memory so read-heavy workloads (`SELECT`) trigger zero redundant `pwrite()` syscalls during cache eviction.
   - **64-Bit File Offset Addressing:** Full `uint64_t` file length and offset tracking supporting `>11 GB` database files without 32-bit integer overflow.
   - Atomic disk persistence using `pread()` and `pwrite()` syscalls with lazy disk reads and zero-initialization via `memset()`.
 
@@ -40,10 +43,10 @@ Tested on Linux (Ubuntu 24.04 LTS, SSD, `gcc -O3`) under a strict **64 MB fixed 
 
 ## Usage Examples
 
-### CRUD & Point Lookups
+### Standard SQL & Quoted Strings
 ```sql
-cqlite > insert 1 suvodeep suvodeep@valko.studio
-cqlite > select where id = 1
-(1, suvodeep, suvodeep@valko.studio)
-cqlite > update 1 suvodeep founder@valko.studio
-cqlite > delete where id = 1
+cqlite > INSERT INTO users VALUES (1, 'Suvodeep Mishra', 'suvodeep@valko.studio');
+cqlite > SELECT * FROM users WHERE id = 1;
+(1, Suvodeep Mishra, suvodeep@valko.studio)
+cqlite > UPDATE users SET email = 'founder@valko.studio' WHERE id = 1;
+cqlite > DELETE FROM users WHERE id = 1;
