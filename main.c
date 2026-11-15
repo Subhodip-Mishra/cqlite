@@ -402,6 +402,11 @@ PrepareResult prepare_statement(InputBuffer *input_buffer, Statement *statement)
         return PREPARE_SYNTAX_ERROR;
     }
 
+    if (!tokenize_input(input_buffer->buffer, &ts)) {
+        printf("Tokenizer error: %s\n", ts.error_msg);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
     if (peek_token(&ts)->type == TOKEN_EOF) {
         return PREPARE_SYNTAX_ERROR;
     }
