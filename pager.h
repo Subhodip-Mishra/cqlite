@@ -37,5 +37,6 @@ void* get_page(Pager* pager, uint32_t page_num);
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size);
 uint32_t get_unused_page_num(Pager* pager);
 void mark_page_dirty(Pager* pager, uint32_t page_num);
+void pager_discard_cache(Pager* pager);
 
 #endif // PAGER_H

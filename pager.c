@@ -246,3 +246,17 @@ void mark_page_dirty(Pager* pager, uint32_t page_num) {
         pager->pages[page_num]->is_dirty = true;
     }
 }
+void pager_discard_cache(Pager* pager) {
+    for (uint32_t i = 0; i < pager->max_pages; i++) {
+        PageFrame* frame = pager->pages[i];
+        if (frame != NULL) {
+            free(frame->data);
+            free(frame);
+            pager->pages[i] = NULL;
+        }
+    }
+    pager->cached_pages = 0;
+    pager->lru_head = NULL;
+    pager->lru_tail = NULL;
+    pager->num_pages = (uint32_t)(pager->file_length / PAGE_SIZE);
+}
