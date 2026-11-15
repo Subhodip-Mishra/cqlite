@@ -3,13 +3,13 @@
 An embedded relational database engine built from scratch in pure C11 (`-Wall -Wextra -Werror`), inspired by SQLite.
 
 ## Architecture
-`SQL String` ➔ `Custom Tokenizer / Lexer` ➔ `Recursive SQL Parser` ➔ `Write-Ahead Log (WAL + CRC32)` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db / .wal)`
+`SQL String` ➔ `Custom Tokenizer / Lexer` ➔ `SQL Parser` ➔ `Write-Ahead Log (WAL + CRC32)` ➔ `B+ Tree Engine` ➔ `64MB LRU Buffer Pool & 4KB Pager` ➔ `Disk (.db / .wal)`
 
 ## Current Features
 - **Custom Tokenizer / Lexer & SQL Parser:**
-  - Zero-allocation state-machine lexer (`tokenizer.c`) supporting single/double-quoted string literals with escape sequences (`'Suvodeep Mishra'`), numeric literals, punctuation, and case-insensitive SQL keywords.
-  - Supports standard SQL queries (`INSERT INTO ... VALUES (...)`, `SELECT * FROM ... WHERE ...`, partial/full column `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`) with optional trailing `;` alongside legacy REPL shorthand commands.
-- **Full CRUD & REPL Engine:** Deterministic execution for `INSERT`, `SELECT` (full scan & `WHERE id = <key>` point lookups), `UPDATE`, and `DELETE`, alongside meta-commands (`.exit`, `.btree`, `.stats`, `.checkpoint`).
+  - Zero-allocation state-machine lexer (`tokenizer.c`) supporting single/double-quoted string literals with escape sequence decoding (`\'`, `\"`, `\\`, `\n`, `\t`), strict token bounds checking, numeric literals, punctuation, and case-insensitive SQL keywords.
+  - Supports standard SQL queries (`INSERT INTO ... VALUES (...)`, `SELECT * FROM ... WHERE ...`, partial/full column `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`) with optional trailing `;` alongside fast REPL shorthand commands.
+- **Full CRUD & REPL Engine:** Deterministic execution for `INSERT`, `SELECT` (full table scan & `WHERE id = <key>` point lookups), `UPDATE`, and `DELETE`, alongside meta-commands (`.exit`, `.btree`, `.stats`, `.checkpoint`).
 - **Write-Ahead Log (WAL) & Crash Recovery:**
   - Append-only binary WAL framing (`Magic` + `OpType` + `Key` + `Row Payload` + `IEEE 802.3 CRC32` checksum) written prior to B+ Tree page mutations.
   - Automatic idempotent crash recovery on startup (`db_open`) with torn-frame detection and `.checkpoint` log truncation via `ftruncate()` + `fsync()`.
@@ -41,12 +41,15 @@ Tested on Linux (Ubuntu 24.04 LTS, SSD, `gcc -O3`) under a strict **64 MB fixed 
 
 > **Key Takeaway:** Scaling from **5.60 GB (10M rows)** to **11.20 GB (20M rows)** increases average random lookup latency by less than **9%** (`229.25 µs` → `248.92 µs`), confirming logarithmic $O(\log N)$ B+ Tree scaling within a bounded 64 MB memory budget.
 
-## Usage Examples
+## Build & Run
 
-### Standard SQL & Quoted Strings
-```sql
-cqlite > INSERT INTO users VALUES (1, 'Suvodeep Mishra', 'suvodeep@valko.studio');
-cqlite > SELECT * FROM users WHERE id = 1;
-(1, Suvodeep Mishra, suvodeep@valko.studio)
-cqlite > UPDATE users SET email = 'founder@valko.studio' WHERE id = 1;
-cqlite > DELETE FROM users WHERE id = 1;
+```bash
+# Build the database engine
+make
+
+# Start an interactive REPL session
+./cqlite mydb.db
+
+# Run the benchmark suite
+gcc -O3 -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L bench.c pager.c table.c btree.c wal.c -o bench
+./bench
